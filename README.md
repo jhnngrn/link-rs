@@ -18,6 +18,7 @@ Port of [github.com/jhnngrn/link](https://github.com/jhnngrn/link) (Go).
 
 ```rust
 use link::{Links, EngineConfig, InviteMode, SyncRequest};
+use serde_json::value::RawValue;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,7 +44,8 @@ ls.register_module(my_module);
 // Incoming sync — Links handles locking, dispatch, persistence, kicks
 let resp = ls.handle_sync(env)?;
 
-// Account API — Links handles locking, commit, and kicks internally
+// Account API — payload is &RawValue (opaque JSON)
+let payload = RawValue::from_string(r#"{"mode":"open"}"#.into()).unwrap();
 let result = ls.handle_account("link.set_invite_mode", &payload)?;
 
 // Resume pending sends at boot
@@ -52,7 +54,7 @@ ls.kick_all();
 
 ## Design
 
-Links owns the full sync lifecycle: dispatch, locking, persistence (via Commit callback), outgoing sends (via Send callback), retry timers, and scheduling. Application modules register with Links and handle domain-specific protocol messages.
+Links owns the full sync lifecycle: dispatch, locking, persistence (via Commit callback), outgoing sends (via Send callback), retry timers, and scheduling. Application modules register with Links and handle domain-specific protocol messages. The pattern follows kernel TCP — the protocol package owns routing and the loop, modules are like sockets dispatched to.
 
 The sync protocol guarantees:
 
@@ -60,6 +62,52 @@ The sync protocol guarantees:
 - **Crash-safe** — persisted before send, persisted before respond
 - **Collision-free** — turn bit determines dominance, alternates each counter
 - **Guaranteed delivery** — sender retries until response received
+
+### Modules
+
+A module is anything that implements the `Module` trait. Links calls `next_tx(peer)` to pull the next outgoing message — it returns `Some((method, payload, ttl))` or `None`. The module decides internally what to send next: a queue, a state machine, a database query, whatever fits. Links doesn't care. It just calls `next_tx`, sends what it gets, and delivers the response back via `handle_response`. Incoming requests arrive through `handle_request`.
+
+Payloads are `Box<RawValue>` — validated but unparsed JSON. The link layer never inspects them; modules parse what they need on their end.
+
+### Connection lifecycle
+
+```
+  create(peer)              incoming link.connect
+      |                           |
+      v                           v
+  +---------+              +----------+
+  | waiting |              | incoming |
+  +----+----+              +-----+----+
+       |                         |
+  link.connect              accept_link
+  mutual or ACK             (intent_connect)
+       |                         |
+       v                         v
+  +-----------+            +-----------+
+  | connected | <----------| connected |
+  +-----------+            +-----------+
+        |
+   intent_close
+   (refs==0)
+        |
+   link.close ACK
+        |
+        v
+    (deleted)
+```
+
+Modules use the same ConnectionState pattern. Close is deferred while refs > 0 — modules finish their work before the link closes.
+
+### Sync loop
+
+Links runs the outgoing sync loop internally:
+
+- **kick(peer)** — triggers a send attempt for a peer (spawns thread)
+- **kick_all()** — kicks all peers, used at boot to resume pending work
+- **schedule(delay, fn)** — runs fn after delay under the Links mutex, kicks any peers fn returns
+- **send_pending(peer)** — acquires the lock, calls next_tx, sends via EngineConfig.send, handles the response, retries on failure
+- **quick_reject(from, method)** — fast pre-auth rejection before expensive signature verification
+- **handle_sync(env)** — incoming sync: validates, dispatches to modules, persists, kicks
 
 ### Timestamps
 
