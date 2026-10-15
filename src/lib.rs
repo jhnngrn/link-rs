@@ -150,10 +150,8 @@ pub struct Link {
     pub pending: Option<QueuedMsg>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_response: Option<SyncResponse>,
-    #[serde(default)]
-    pub req_timestamp: i64,
-    #[serde(default)]
-    pub resp_timestamp: i64,
+    #[serde(default, rename = "ts")]
+    pub timestamp: i64,
 }
 
 impl Link {
@@ -165,8 +163,7 @@ impl Link {
             turn_bit: bit,
             pending: None,
             cached_response: None,
-            req_timestamp: 0,
-            resp_timestamp: 0,
+            timestamp: 0,
         }
     }
 
@@ -212,7 +209,7 @@ impl Link {
         };
         self.cached_response = Some(resp.clone());
         self.counter += 1;
-        self.req_timestamp = ts;
+        self.timestamp = ts;
         self.pending = None;
         resp
     }
@@ -220,7 +217,7 @@ impl Link {
     /// Finalize a received response to our outgoing message.
     pub fn accept_response(&mut self, ts: i64) {
         self.counter += 1;
-        self.resp_timestamp = ts;
+        self.timestamp = ts;
         self.pending = None;
     }
 
