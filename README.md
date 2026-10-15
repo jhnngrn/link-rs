@@ -1,6 +1,6 @@
 # link
 
-Bilateral sync primitive in Rust. A sequential channel between two peers — one request-response pair per counter tick, either side can initiate, turn bit resolves collisions. Requests and responses are persisted before sending, making retransmission idempotent.
+Crash-safe bilateral channel with a shared counter — one decision in flight at a time, so races never arise. Persist before send, persist before respond, retry until delivered. Application modules plug in and write plain request/response logic; link handles ordering, collisions, and crash recovery.
 
 Port of [github.com/jhnngrn/link](https://github.com/jhnngrn/link) (Go).
 
