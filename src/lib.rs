@@ -1,10 +1,13 @@
-//! Bilateral sync primitive — data structures and protocol types for a single
-//! link between two parties.
+//! Bilateral sync primitive — data structures, protocol types and sync loop
+//! for bilateral links between parties.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -17,10 +20,13 @@ pub enum LinkError {
     Collision,
     BadPayload,
     NoPeer(String),
+    MaxLinks,
+    InvitesDisabled,
     InvalidMode(String),
     RefsHeld,
     NoIncomingModule(String),
     UnknownMethod(String),
+    Timestamp,
     Other(String),
 }
 
@@ -33,15 +39,30 @@ impl fmt::Display for LinkError {
             Self::BadPayload => write!(f, "bad payload"),
             Self::RefsHeld => write!(f, "close with refs > 0"),
             Self::NoPeer(p) => write!(f, "no link to {p}"),
+            Self::MaxLinks => write!(f, "max links"),
+            Self::InvitesDisabled => write!(f, "invites disabled"),
             Self::InvalidMode(m) => write!(f, "invalid mode {m:?}"),
             Self::NoIncomingModule(m) => write!(f, "no incoming module {m}"),
             Self::UnknownMethod(m) => write!(f, "unknown link method {m:?}"),
+            Self::Timestamp => write!(f, "timestamp out of range"),
             Self::Other(s) => write!(f, "{s}"),
         }
     }
 }
 
 impl std::error::Error for LinkError {}
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Maximum number of links per node.
+pub const MAX_LINKS: usize = 64;
+
+/// Maximum number of seconds a peer's timestamp may be ahead of our local
+/// clock. Generous to tolerate clock drift; the main defence against
+/// exploitation is the backward check (monotonicity).
+pub const MAX_TIMESTAMP_FUTURE: i64 = 600; // 10 minutes
 
 // ---------------------------------------------------------------------------
 // ConnectionStatus / ConnectionState
@@ -63,11 +84,11 @@ pub struct ConnectionState {
     pub intent_connect: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub intent_close: bool,
-    #[serde(default, skip_serializing_if = "is_zero")]
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub refs: u32,
 }
 
-fn is_zero(v: &u32) -> bool {
+fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
 
@@ -101,6 +122,41 @@ pub struct LinkState {
 }
 
 // ---------------------------------------------------------------------------
+// Module trait
+// ---------------------------------------------------------------------------
+
+/// Module processes sync methods and account API calls for a namespace.
+/// HandleRequest returns (ok, kicks, err) where kicks is a list of peers
+/// that need kicking on other links (cross-link side effects).
+/// HandleResponse returns kicks for the same purpose.
+/// HandleAccount handles user-facing API calls.
+/// NextTx returns the next queued message to send on a peer, or None.
+pub trait Module: Send + Sync {
+    fn name(&self) -> &str;
+    fn handle_request(
+        &mut self,
+        peer: &str,
+        method: &str,
+        payload: &Value,
+        ts: i64,
+    ) -> Result<(bool, Vec<String>), LinkError>;
+    fn handle_response(
+        &mut self,
+        peer: &str,
+        method: &str,
+        payload: &Value,
+        ok: bool,
+        ts: i64,
+    ) -> Vec<String>;
+    fn handle_account(
+        &mut self,
+        method: &str,
+        payload: &Value,
+    ) -> Result<(Value, Vec<String>), LinkError>;
+    fn next_tx(&self, peer: &str) -> Option<QueuedMsg>;
+}
+
+// ---------------------------------------------------------------------------
 // QueuedMsg
 // ---------------------------------------------------------------------------
 
@@ -109,6 +165,53 @@ pub struct QueuedMsg {
     pub method: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<Value>,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub queued_at: i64,
+}
+
+fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
+}
+
+/// Reports whether a should win over b (older queued_at wins).
+/// Zero queued_at means unset — unset loses to any set value.
+/// Equal values (including both zero) return false, preserving
+/// the earlier candidate.
+pub fn older_queued_msg(a: &QueuedMsg, b: Option<&QueuedMsg>) -> bool {
+    let Some(b) = b else {
+        return true;
+    };
+    if a.queued_at == 0 && b.queued_at == 0 {
+        return false;
+    }
+    if a.queued_at == 0 {
+        return false;
+    }
+    if b.queued_at == 0 {
+        return true;
+    }
+    a.queued_at < b.queued_at
+}
+
+// ---------------------------------------------------------------------------
+// PeerSend — outgoing send lifecycle tracking
+// ---------------------------------------------------------------------------
+
+/// PeerSend tracks the outgoing send lifecycle for a link at a given counter.
+/// InFlight means a thread is blocked on Send.
+/// After the send completes, a retry timer is set: refractory after error
+/// (blocks kicks), non-refractory after success (fallback, kicks bypass).
+/// Both are scoped to counter — if counter advances via HandleSync,
+/// the entry is stale and ignored.
+#[derive(Debug)]
+pub struct PeerSend {
+    pub counter: u64,
+    pub in_flight: bool,
+    pub refractory: bool,
+    // Timer handle — when set, a thread is sleeping and will call sendPending.
+    // We track it as an Arc<()> "cancel token": when we replace PeerSend,
+    // the old Arc drops and the timer thread detects it via weak ref.
+    pub cancel: Option<Arc<()>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +226,7 @@ pub struct SyncRequest {
     pub method: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<Value>,
+    #[serde(default)]
     pub timestamp: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resp: Option<SyncResponse>,
@@ -139,9 +243,7 @@ pub struct SyncResponse {
 // Link
 // ---------------------------------------------------------------------------
 
-pub const MAX_LINKS: usize = 64;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Link {
     pub state: LinkState,
     pub counter: u64,
@@ -152,6 +254,22 @@ pub struct Link {
     pub cached_response: Option<SyncResponse>,
     #[serde(default, rename = "ts")]
     pub timestamp: i64,
+    #[serde(skip)]
+    pub send: Option<PeerSend>,
+}
+
+impl Clone for Link {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            counter: self.counter,
+            turn_bit: self.turn_bit,
+            pending: self.pending.clone(),
+            cached_response: self.cached_response.clone(),
+            timestamp: self.timestamp,
+            send: None, // runtime state, not cloned
+        }
+    }
 }
 
 impl Link {
@@ -164,6 +282,7 @@ impl Link {
             pending: None,
             cached_response: None,
             timestamp: 0,
+            send: None,
         }
     }
 
@@ -179,6 +298,8 @@ impl Link {
             .get(name)
             .is_some_and(|c| c.status == Some(ConnectionStatus::Connected))
     }
+
+    // --- Sync lifecycle ---
 
     /// Validate an incoming request counter.
     /// Returns Ok(Some(resp)) for cached stale, Ok(None) for proceed, Err for invalid.
@@ -198,6 +319,19 @@ impl Link {
             return Err(LinkError::Collision);
         }
         Ok(None)
+    }
+
+    /// Validate that ts is within acceptable bounds:
+    /// - not before the link's latest timestamp (monotonicity)
+    /// - not more than MAX_TIMESTAMP_FUTURE seconds ahead of now
+    pub fn validate_timestamp(&self, ts: i64, now: i64) -> Result<(), LinkError> {
+        if ts < self.timestamp {
+            return Err(LinkError::Timestamp);
+        }
+        if ts > now + MAX_TIMESTAMP_FUTURE {
+            return Err(LinkError::Timestamp);
+        }
+        Ok(())
     }
 
     /// Finalize an incoming request. Returns the response to send back.
@@ -221,12 +355,12 @@ impl Link {
         self.pending = None;
     }
 
-    // --- Module negotiation (internal) ---
+    // --- Module negotiation ---
 
     fn req_module(
         &mut self,
         payload: &Value,
-        supported: &HashMap<String, ()>,
+        modules: &HashMap<String, Box<dyn Module>>,
         invite_mode: InviteMode,
     ) -> Result<bool, LinkError> {
         let name = payload
@@ -236,17 +370,21 @@ impl Link {
         if name.is_empty() {
             return Err(LinkError::BadPayload);
         }
-        if !supported.contains_key(name) {
-            return Ok(false);
+        if !modules.contains_key(name) {
+            return Ok(false); // we don't speak this module
         }
 
-        let name = name.to_string();
-        let mod_state = self.state.modules.get(&name);
+        // Already connected — idempotent ACK.
+        if let Some(m) = self.state.modules.get(name) {
+            if m.status == Some(ConnectionStatus::Connected) {
+                return Ok(true);
+            }
+        }
 
         // Mutual — we also want this module.
-        if let Some(m) = mod_state {
+        if let Some(m) = self.state.modules.get(name) {
             if m.intent_connect || m.status == Some(ConnectionStatus::Waiting) {
-                let m = self.state.modules.get_mut(&name).unwrap();
+                let m = self.state.modules.get_mut(name).unwrap();
                 m.status = Some(ConnectionStatus::Connected);
                 m.intent_connect = false;
                 return Ok(true);
@@ -258,7 +396,7 @@ impl Link {
             let m = self
                 .state
                 .modules
-                .entry(name)
+                .entry(name.to_string())
                 .or_insert_with(ConnectionState::default);
             m.status = Some(ConnectionStatus::Connected);
             return Ok(true);
@@ -268,10 +406,10 @@ impl Link {
         let m = self
             .state
             .modules
-            .entry(name)
+            .entry(name.to_string())
             .or_insert_with(ConnectionState::default);
         m.status = Some(ConnectionStatus::Incoming);
-        Ok(false) // NACK — not accepted yet
+        Ok(false) // NACK
     }
 
     fn resp_module(&mut self, payload: &Value, ok: bool) {
@@ -290,14 +428,21 @@ impl Link {
     }
 
     /// Propose the given modules on this link, filtering by supported.
-    pub fn set_modules(&mut self, modules: &[String], supported: &HashMap<String, ()>) {
+    /// Modules not in the desired set and not yet connected are removed,
+    /// unless they are in the protected set.
+    pub fn set_modules(
+        &mut self,
+        modules: &[String],
+        registered: &HashMap<String, Box<dyn Module>>,
+        protected: &HashMap<String, ()>,
+    ) {
         let desired: HashMap<&str, ()> = modules
             .iter()
-            .filter(|n| supported.contains_key(n.as_str()))
+            .filter(|n| registered.contains_key(n.as_str()))
             .map(|n| (n.as_str(), ()))
             .collect();
 
-        for name in desired.keys() {
+        for &name in desired.keys() {
             let name_s = name.to_string();
             let m = self
                 .state
@@ -314,7 +459,7 @@ impl Link {
             .modules
             .iter()
             .filter(|(name, m)| {
-                name.as_str() != "trustline"
+                !protected.contains_key(name.as_str())
                     && !desired.contains_key(name.as_str())
                     && m.status != Some(ConnectionStatus::Connected)
             })
@@ -369,174 +514,697 @@ impl Default for InviteMode {
         Self::Invite
     }
 }
+
 // ---------------------------------------------------------------------------
-// Links — collection of links for a node
+// EngineConfig — callbacks the sync loop needs
 // ---------------------------------------------------------------------------
 
-/// Result of handle_request.
-pub struct RequestResult {
-    pub ok: bool,
+/// EngineConfig provides the callbacks Links needs to run the sync loop.
+pub struct EngineConfig {
+    /// Send delivers a sync message to a peer and returns the response body.
+    pub send: Box<dyn Fn(&str, &SyncRequest) -> Result<Vec<u8>, String> + Send + Sync>,
+    /// Commit persists the current state. Called under the mutex.
+    pub commit: Box<dyn Fn() + Send + Sync>,
+    /// Now returns the current time as unix seconds.
+    pub now: Box<dyn Fn() -> i64 + Send + Sync>,
+    /// Retry delay between retry attempts.
+    pub retry_delay: Duration,
 }
 
-pub struct Links {
-    links: HashMap<String, Link>,
+// ---------------------------------------------------------------------------
+// Links — collection of links for a node, including the sync loop
+// ---------------------------------------------------------------------------
+
+/// Inner state protected by the mutex.
+struct LinksInner {
+    m: HashMap<String, Link>,
     self_id: String,
-    pub invite_mode: InviteMode,
-    pub supported: HashMap<String, ()>,
+    invite_mode: InviteMode,
+    protected: HashMap<String, ()>,
+    modules: HashMap<String, Box<dyn Module>>,
+    stopped: bool,
+}
+
+/// Links manages the set of bilateral links for a node.
+/// Thread-safe — all methods acquire the internal mutex.
+pub struct Links {
+    inner: Arc<Mutex<LinksInner>>,
+    engine: Arc<EngineConfig>,
 }
 
 impl Links {
     pub fn new(
         self_id: String,
-        links: HashMap<String, Link>,
-        invite_mode: InviteMode,
-        supported: HashMap<String, ()>,
+        m: HashMap<String, Link>,
+        mode: InviteMode,
+        engine: EngineConfig,
     ) -> Self {
+        let retry_delay = if engine.retry_delay == Duration::ZERO {
+            Duration::from_secs(60)
+        } else {
+            engine.retry_delay
+        };
+        let engine = Arc::new(EngineConfig {
+            send: engine.send,
+            commit: engine.commit,
+            now: engine.now,
+            retry_delay,
+        });
         Self {
-            links,
-            self_id,
-            invite_mode,
-            supported,
+            inner: Arc::new(Mutex::new(LinksInner {
+                m,
+                self_id,
+                invite_mode: mode,
+                protected: HashMap::new(),
+                modules: HashMap::new(),
+                stopped: false,
+            })),
+            engine,
         }
     }
 
-    pub fn get(&self, peer: &str) -> Option<&Link> {
-        self.links.get(peer)
+    /// Returns the node identity.
+    pub fn self_id(&self) -> String {
+        self.inner.lock().unwrap().self_id.clone()
     }
 
-    pub fn get_mut(&mut self, peer: &str) -> Option<&mut Link> {
-        self.links.get_mut(peer)
+    /// Register a module.
+    pub fn register_module(&self, m: Box<dyn Module>) {
+        let name = m.name().to_string();
+        self.inner.lock().unwrap().modules.insert(name, m);
+    }
+
+    /// Add a module name to the protected set (SetModules cannot remove it).
+    pub fn protect_module(&self, name: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .protected
+            .insert(name.to_string(), ());
+    }
+
+    pub fn get_link(&self, peer: &str) -> Option<Link> {
+        self.inner.lock().unwrap().m.get(peer).cloned()
     }
 
     pub fn len(&self) -> usize {
-        self.links.len()
+        self.inner.lock().unwrap().m.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.links.is_empty()
+        self.inner.lock().unwrap().m.is_empty()
     }
 
+    /// Returns the invite mode.
+    pub fn invite_mode(&self) -> InviteMode {
+        self.inner.lock().unwrap().invite_mode
+    }
+
+    /// Set the invite mode.
+    pub fn set_invite_mode(&self, mode: InviteMode) {
+        self.inner.lock().unwrap().invite_mode = mode;
+    }
+
+    /// Returns a snapshot of all links.
+    pub fn map(&self) -> HashMap<String, Link> {
+        self.inner.lock().unwrap().m.clone()
+    }
+
+    /// Create a new link to peer.
+    pub fn create(&self, peer: &str) -> Link {
+        let mut inner = self.inner.lock().unwrap();
+        let lk = Link::new(&inner.self_id, peer);
+        inner.m.entry(peer.to_string()).or_insert(lk).clone()
+    }
+
+    /// Delete a link.
+    pub fn delete(&self, peer: &str) {
+        self.inner.lock().unwrap().m.remove(peer);
+    }
+
+    /// Returns true if at max links.
     pub fn full(&self) -> bool {
-        self.links.len() >= MAX_LINKS
+        self.inner.lock().unwrap().m.len() >= MAX_LINKS
     }
 
-    pub fn delete(&mut self, peer: &str) {
-        self.links.remove(peer);
+    // --- Sync loop: incoming ---
+
+    /// QuickReject returns true if this request can be rejected before
+    /// expensive signature verification.
+    pub fn quick_reject(&self, from: &str, method: &str) -> bool {
+        let from = from.to_lowercase();
+        let inner = self.inner.lock().unwrap();
+        inner.m.get(&from).is_none() && method != "link.connect" && method != "link.close"
     }
 
-    pub fn create(&mut self, peer: &str) -> &mut Link {
-        let lk = Link::new(&self.self_id, peer);
-        self.links.entry(peer.to_string()).or_insert(lk)
-    }
+    /// HandleSync processes an incoming sync request.
+    pub fn handle_sync(&self, mut env: SyncRequest) -> Result<SyncResponse, LinkError> {
+        env.from = env.from.to_lowercase();
+        let mut inner = self.inner.lock().unwrap();
 
-    pub fn map(&self) -> &HashMap<String, Link> {
-        &self.links
-    }
-
-    // --- Link-level request/response handling ---
-
-    pub fn handle_request(
-        &mut self,
-        peer: &str,
-        method: &str,
-        payload: &Value,
-    ) -> Result<RequestResult, LinkError> {
-        let l = self
-            .links
-            .get_mut(peer)
-            .ok_or_else(|| LinkError::NoPeer(peer.to_string()))?;
-
-        match method {
-            "connect" => {
-                if l.state.connection.intent_connect
-                    || l.state.connection.status == Some(ConnectionStatus::Waiting)
-                {
-                    l.state.connection.status = Some(ConnectionStatus::Connected);
-                    l.state.connection.intent_connect = false;
-                    return Ok(RequestResult { ok: true });
-                }
-                if self.invite_mode == InviteMode::Open {
-                    l.state.connection.status = Some(ConnectionStatus::Connected);
-                    return Ok(RequestResult { ok: true });
-                }
-                Ok(RequestResult { ok: false })
+        if inner.m.get(&env.from).is_none() {
+            if env.method == "link.close" {
+                let now = (self.engine.now)();
+                return Ok(SyncResponse {
+                    counter: env.counter,
+                    ok: true,
+                    timestamp: now,
+                });
             }
-            "close" => {
-                if l.state.connection.refs > 0 {
-                    return Err(LinkError::RefsHeld);
-                }
-                self.links.remove(peer);
-                Ok(RequestResult { ok: true })
+            if env.method != "link.connect" {
+                return Err(LinkError::NoPeer(env.from.clone()));
             }
-            "module" => {
-                let supported = self.supported.clone();
-                let ok = l.req_module(payload, &supported, self.invite_mode)?;
-                Ok(RequestResult { ok })
+            if inner.invite_mode == InviteMode::Closed {
+                return Err(LinkError::InvitesDisabled);
             }
-            _ => Err(LinkError::UnknownMethod(method.to_string())),
+            if inner.m.len() >= MAX_LINKS {
+                return Err(LinkError::MaxLinks);
+            }
+            let lk = Link::new(&inner.self_id, &env.from);
+            inner.m.insert(env.from.clone(), lk);
+            inner.m.get_mut(&env.from).unwrap().state.connection.status =
+                Some(ConnectionStatus::Incoming);
+        }
+
+        let now = (self.engine.now)();
+
+        // Piggybacked response.
+        let mut pb_kicks = Vec::new();
+        if let Some(ref resp) = env.resp {
+            let lk = inner.m.get(&env.from).unwrap();
+            if lk.pending.is_some() && resp.counter == lk.counter {
+                lk.validate_timestamp(resp.timestamp, now)?;
+                let pending_method = lk.pending.as_ref().unwrap().method.clone();
+                let pending_payload = lk.pending.as_ref().unwrap().payload.clone();
+                let resp_ok = resp.ok;
+                let resp_ts = resp.timestamp;
+                pb_kicks = Self::dispatch_response_inner(
+                    &mut inner,
+                    &env.from,
+                    &pending_method,
+                    &pending_payload.unwrap_or(Value::Null),
+                    resp_ok,
+                    resp_ts,
+                );
+                let lk = inner.m.get_mut(&env.from).unwrap();
+                lk.accept_response(resp_ts);
+                (self.engine.commit)();
+            }
+        }
+
+        // Validate counter and collision.
+        let lk = inner.m.get(&env.from).unwrap();
+        if let Some(cached) = lk.validate_request(env.counter)? {
+            drop(inner);
+            for k in pb_kicks {
+                self.kick(&k);
+            }
+            return Ok(cached);
+        }
+
+        // Determine timestamp.
+        let lk = inner.m.get(&env.from).unwrap();
+        let ts = if lk.dominant() {
+            let mut ts = now;
+            if ts < lk.timestamp {
+                ts = lk.timestamp;
+            }
+            ts
+        } else {
+            env.timestamp
+        };
+
+        // Validate peer timestamp.
+        let lk = inner.m.get(&env.from).unwrap();
+        lk.validate_timestamp(ts, now)?;
+
+        // Dispatch to handler.
+        let (ok, kicks) =
+            Self::dispatch_request_inner(&mut inner, &env.from, &env.method, &env.payload.unwrap_or(Value::Null), ts)?;
+
+        let lk = inner.m.get_mut(&env.from).unwrap();
+        let resp = lk.accept_request(env.counter, ok, ts);
+        (self.engine.commit)();
+
+        let from = env.from.clone();
+        drop(inner);
+
+        self.kick(&from);
+        for k in pb_kicks {
+            self.kick(&k);
+        }
+        for k in kicks {
+            self.kick(&k);
+        }
+
+        Ok(resp)
+    }
+
+    // --- Sync loop: outgoing ---
+
+    /// Kick triggers a sendPending for the given peer.
+    pub fn kick(&self, peer: &str) {
+        let peer = peer.to_string();
+        let links = Links {
+            inner: Arc::clone(&self.inner),
+            engine: Arc::clone(&self.engine),
+        };
+        thread::spawn(move || {
+            links.send_pending(&peer);
+        });
+    }
+
+    /// KickAll kicks all peers. Used at boot to resume pending work.
+    pub fn kick_all(&self) {
+        let peers: Vec<String> = self.inner.lock().unwrap().m.keys().cloned().collect();
+        for p in peers {
+            self.kick(&p);
         }
     }
 
-    /// Processes a link-namespace response. Deletes the link on accepted close.
-    pub fn handle_response(&mut self, peer: &str, method: &str, payload: &Value, ok: bool) {
-        let Some(l) = self.links.get_mut(peer) else {
+    /// Schedule runs fn after delay under the Links mutex.
+    /// fn returns a list of peers to kick. Links commits and kicks.
+    pub fn schedule<F>(&self, delay: Duration, f: F)
+    where
+        F: FnOnce(&mut HashMap<String, Link>) -> Vec<String> + Send + 'static,
+    {
+        let inner = Arc::clone(&self.inner);
+        let engine = Arc::clone(&self.engine);
+        let links = Links {
+            inner: Arc::clone(&self.inner),
+            engine: Arc::clone(&self.engine),
+        };
+        thread::spawn(move || {
+            thread::sleep(delay);
+            let mut guard = inner.lock().unwrap();
+            if guard.stopped {
+                return;
+            }
+            let kicks = f(&mut guard.m);
+            (engine.commit)();
+            drop(guard);
+            for k in kicks {
+                links.kick(&k);
+            }
+        });
+    }
+
+    /// Stop marks the Links as stopped. After Stop, Schedule callbacks
+    /// and sendPending are no-ops.
+    pub fn stop(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.stopped = true;
+        // Cancel all pending send timers.
+        for (_, lk) in inner.m.iter_mut() {
+            lk.send = None;
+        }
+    }
+
+    fn send_pending(&self, peer: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.stopped {
+            return;
+        }
+        let Some(lk) = inner.m.get_mut(peer) else {
             return;
         };
-        match method {
-            "connect" => {
-                l.state.connection.status = if ok {
-                    Some(ConnectionStatus::Connected)
-                } else {
-                    Some(ConnectionStatus::Waiting)
-                };
-                l.state.connection.intent_connect = false;
+
+        // Check send lifecycle.
+        if let Some(ref s) = lk.send {
+            if s.counter == lk.counter && (s.in_flight || s.refractory) {
+                return;
             }
-            "close" => {
-                if ok {
-                    self.links.remove(peer);
+        }
+        lk.send = None;
+
+        // Promote if needed.
+        let mut promoted = false;
+        if lk.pending.is_none() {
+            let msg = Self::next_tx_inner(&inner, peer);
+            if let Some(msg) = msg {
+                inner.m.get_mut(peer).unwrap().pending = Some(msg);
+                promoted = true;
+            } else {
+                return;
+            }
+        }
+
+        let lk = inner.m.get_mut(peer).unwrap();
+        let counter = lk.counter;
+        let is_dominant = lk.dominant();
+        let floor = lk.timestamp;
+        let msg = lk.pending.clone().unwrap();
+        let resp_piggyback = lk.cached_response.clone();
+        lk.send = Some(PeerSend {
+            counter,
+            in_flight: true,
+            refractory: false,
+            cancel: None,
+        });
+
+        let mut env = SyncRequest {
+            from: inner.self_id.clone(),
+            to: peer.to_string(),
+            counter,
+            method: msg.method.clone(),
+            payload: msg.payload.clone(),
+            timestamp: 0,
+            resp: resp_piggyback,
+        };
+        if is_dominant {
+            env.timestamp = (self.engine.now)();
+            if env.timestamp < floor {
+                env.timestamp = floor;
+            }
+        }
+        if promoted {
+            (self.engine.commit)();
+        }
+        let self_id = inner.self_id.clone();
+        drop(inner);
+
+        let result = (self.engine.send)(peer, &env);
+
+        let mut inner = self.inner.lock().unwrap();
+        let peer_s = peer.to_string();
+
+        match result {
+            Err(e) => {
+                log::warn!("[link] {}->{} {}: {}", self_id, peer, msg.method, e);
+                self.set_retry_inner(&mut inner, &peer_s, counter, true);
+                return;
+            }
+            Ok(body) => {
+                let resp: SyncResponse = match serde_json::from_slice(&body) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        self.set_retry_inner(&mut inner, &peer_s, counter, true);
+                        return;
+                    }
+                };
+
+                let Some(lk) = inner.m.get(peer) else {
+                    return;
+                };
+                // Stale check.
+                if lk.pending.is_none()
+                    || lk.pending.as_ref().unwrap().method != msg.method
+                    || lk.counter != counter
+                    || resp.counter != counter
+                {
+                    if let Some(lk) = inner.m.get_mut(peer) {
+                        lk.send = None;
+                    }
+                    return;
+                }
+
+                let now = (self.engine.now)();
+                if lk.validate_timestamp(resp.timestamp, now).is_err() {
+                    log::warn!(
+                        "[link] {}->{}: bad response timestamp",
+                        self_id, peer
+                    );
+                    self.set_retry_inner(&mut inner, &peer_s, counter, true);
+                    return;
+                }
+
+                let payload = msg.payload.clone().unwrap_or(Value::Null);
+                let extra_kicks = Self::dispatch_response_inner(
+                    &mut inner,
+                    peer,
+                    &msg.method,
+                    &payload,
+                    resp.ok,
+                    resp.timestamp,
+                );
+
+                let lk = inner.m.get_mut(peer).unwrap();
+                lk.accept_response(resp.timestamp);
+
+                let kick_peer = if inner.m.contains_key(peer) {
+                    let next = Self::next_tx_inner(&inner, peer);
+                    if let Some(next) = next {
+                        inner.m.get_mut(peer).unwrap().pending = Some(next);
+                        true
+                    } else {
+                        false
+                    }
                 } else {
-                    l.state.connection.intent_close = false;
+                    false
+                };
+
+                (self.engine.commit)();
+                if let Some(lk) = inner.m.get_mut(peer) {
+                    lk.send = None;
+                }
+                drop(inner);
+
+                if kick_peer {
+                    self.kick(peer);
+                }
+                for k in extra_kicks {
+                    self.kick(&k);
                 }
             }
-            "module" => {
-                l.resp_module(payload, ok);
-            }
-            _ => {}
         }
     }
 
-    /// Returns the next link-level message to send, or None.
-    pub fn next_tx(&self, peer: &str) -> Option<QueuedMsg> {
-        let l = self.links.get(peer)?;
-        if l.state.connection.intent_close && l.state.connection.refs == 0 {
+    fn set_retry_inner(
+        &self,
+        inner: &mut LinksInner,
+        peer: &str,
+        counter: u64,
+        refractory: bool,
+    ) {
+        if inner.stopped {
+            return;
+        }
+        let Some(lk) = inner.m.get_mut(peer) else {
+            return;
+        };
+        let cancel = Arc::new(());
+        let weak = Arc::downgrade(&cancel);
+        lk.send = Some(PeerSend {
+            counter,
+            in_flight: false,
+            refractory,
+            cancel: Some(cancel),
+        });
+
+        let peer_s = peer.to_string();
+        let links = Links {
+            inner: Arc::clone(&self.inner),
+            engine: Arc::clone(&self.engine),
+        };
+        let delay = self.engine.retry_delay;
+        thread::spawn(move || {
+            thread::sleep(delay);
+            // Check if this timer is still the active one.
+            if weak.upgrade().is_none() {
+                return; // cancelled
+            }
+            {
+                let mut inner = links.inner.lock().unwrap();
+                if let Some(lk) = inner.m.get_mut(&peer_s) {
+                    // Clear send only if it's still ours.
+                    if let Some(ref s) = lk.send {
+                        if s.counter == counter {
+                            lk.send = None;
+                        }
+                    }
+                }
+            }
+            links.send_pending(&peer_s);
+        });
+    }
+
+    // --- Dispatch helpers (called with lock held) ---
+
+    fn dispatch_request_inner(
+        inner: &mut LinksInner,
+        peer: &str,
+        full_method: &str,
+        payload: &Value,
+        ts: i64,
+    ) -> Result<(bool, Vec<String>), LinkError> {
+        let (ns, method) = split_method(full_method);
+
+        if ns == "link" {
+            let lk = inner
+                .m
+                .get_mut(peer)
+                .ok_or_else(|| LinkError::NoPeer(peer.to_string()))?;
+            match method {
+                "connect" => {
+                    if lk.state.connection.intent_connect
+                        || lk.state.connection.status == Some(ConnectionStatus::Waiting)
+                    {
+                        lk.state.connection.status = Some(ConnectionStatus::Connected);
+                        lk.state.connection.intent_connect = false;
+                        return Ok((true, vec![]));
+                    }
+                    if inner.invite_mode == InviteMode::Open {
+                        lk.state.connection.status = Some(ConnectionStatus::Connected);
+                        return Ok((true, vec![]));
+                    }
+                    Ok((false, vec![]))
+                }
+                "close" => {
+                    if lk.state.connection.refs > 0 {
+                        return Err(LinkError::RefsHeld);
+                    }
+                    inner.m.remove(peer);
+                    Ok((true, vec![]))
+                }
+                "module" => {
+                    let invite_mode = inner.invite_mode;
+                    let lk = inner.m.get_mut(peer).unwrap();
+                    let ok = lk.req_module(payload, &inner.modules, invite_mode)?;
+                    Ok((ok, vec![]))
+                }
+                _ => Err(LinkError::UnknownMethod(method.to_string())),
+            }
+        } else {
+            let lk = inner
+                .m
+                .get(peer)
+                .ok_or_else(|| LinkError::NoPeer(peer.to_string()))?;
+            if !lk.module_enabled(ns) {
+                return Err(LinkError::UnknownMethod(full_method.to_string()));
+            }
+            let module = inner
+                .modules
+                .get_mut(ns)
+                .ok_or_else(|| LinkError::UnknownMethod(full_method.to_string()))?;
+            module.handle_request(peer, method, payload, ts)
+        }
+    }
+
+    fn dispatch_response_inner(
+        inner: &mut LinksInner,
+        peer: &str,
+        full_method: &str,
+        payload: &Value,
+        ok: bool,
+        ts: i64,
+    ) -> Vec<String> {
+        let (ns, method) = split_method(full_method);
+
+        if ns == "link" {
+            let Some(lk) = inner.m.get_mut(peer) else {
+                return vec![];
+            };
+            match method {
+                "connect" => {
+                    lk.state.connection.status = if ok {
+                        Some(ConnectionStatus::Connected)
+                    } else {
+                        Some(ConnectionStatus::Waiting)
+                    };
+                    lk.state.connection.intent_connect = false;
+                }
+                "close" => {
+                    if ok {
+                        inner.m.remove(peer);
+                    } else if let Some(lk) = inner.m.get_mut(peer) {
+                        lk.state.connection.intent_close = false;
+                    }
+                }
+                "module" => {
+                    lk.resp_module(payload, ok);
+                }
+                _ => {}
+            }
+            vec![]
+        } else {
+            let Some(module) = inner.modules.get_mut(ns) else {
+                return vec![];
+            };
+            module.handle_response(peer, method, payload, ok, ts)
+        }
+    }
+
+    fn next_tx_inner(inner: &LinksInner, peer: &str) -> Option<QueuedMsg> {
+        let lk = inner.m.get(peer)?;
+
+        // Link-level messages have absolute priority.
+        if lk.state.connection.intent_close && lk.state.connection.refs == 0 {
             return Some(QueuedMsg {
-                method: "close".into(),
+                method: "link.close".into(),
                 payload: None,
+                queued_at: 0,
             });
         }
-        if l.state.connection.intent_connect {
+        if lk.state.connection.intent_connect {
             return Some(QueuedMsg {
-                method: "connect".into(),
+                method: "link.connect".into(),
                 payload: None,
+                queued_at: 0,
             });
         }
-        if l.state.connection.status == Some(ConnectionStatus::Connected) {
-            for (name, m) in &l.state.modules {
+        if lk.state.connection.status == Some(ConnectionStatus::Connected) {
+            for (name, m) in &lk.state.modules {
                 if m.intent_connect {
                     return Some(QueuedMsg {
-                        method: "module".into(),
+                        method: "link.module".into(),
                         payload: Some(serde_json::json!({"name": name})),
+                        queued_at: 0,
                     });
                 }
             }
         }
-        None
+
+        // Module messages — oldest QueuedAt wins.
+        if lk.state.connection.status != Some(ConnectionStatus::Connected) {
+            return None;
+        }
+        let mut best: Option<QueuedMsg> = None;
+        for (name, module) in &inner.modules {
+            if !lk.module_enabled(name) {
+                continue;
+            }
+            if let Some(mut msg) = module.next_tx(peer) {
+                msg.method = format!("{}.{}", name, msg.method);
+                if older_queued_msg(&msg, best.as_ref()) {
+                    best = Some(msg);
+                }
+            }
+        }
+        best
     }
 
     // --- Account operations ---
 
+    /// HandleAccount dispatches an account API call by namespace.
+    /// Handles locking, commit, and kicks internally.
     pub fn handle_account(
-        &mut self,
+        &self,
+        full_method: &str,
+        payload: &Value,
+    ) -> Result<Value, LinkError> {
+        let mut inner = self.inner.lock().unwrap();
+        let (ns, method) = split_method(full_method);
+
+        let (result, kicks) = if ns == "link" {
+            Self::handle_link_account_inner(&mut inner, method, payload)?
+        } else {
+            let module = inner
+                .modules
+                .get_mut(ns)
+                .ok_or_else(|| LinkError::UnknownMethod(full_method.to_string()))?;
+            module.handle_account(method, payload)?
+        };
+
+        (self.engine.commit)();
+        drop(inner);
+        for k in kicks {
+            self.kick(&k);
+        }
+        Ok(result)
+    }
+
+    fn handle_link_account_inner(
+        inner: &mut LinksInner,
         method: &str,
         payload: &Value,
     ) -> Result<(Value, Vec<String>), LinkError> {
@@ -552,7 +1220,7 @@ impl Links {
                     "open" => InviteMode::Open,
                     _ => return Err(LinkError::InvalidMode(mode_str.to_string())),
                 };
-                self.invite_mode = mode;
+                inner.invite_mode = mode;
                 Ok((serde_json::json!("ok"), vec![]))
             }
             "set_modules" => {
@@ -568,12 +1236,11 @@ impl Links {
                     .filter_map(Value::as_str)
                     .map(String::from)
                     .collect();
-                let supported = self.supported.clone();
-                let l = self
-                    .links
+                let lk = inner
+                    .m
                     .get_mut(peer)
                     .ok_or_else(|| LinkError::NoPeer(peer.to_string()))?;
-                l.set_modules(&modules, &supported);
+                lk.set_modules(&modules, &inner.modules, &inner.protected);
                 Ok((serde_json::json!("ok"), vec![peer.to_string()]))
             }
             "accept_module" => {
@@ -585,11 +1252,11 @@ impl Links {
                     .get("module")
                     .and_then(Value::as_str)
                     .ok_or(LinkError::BadPayload)?;
-                let l = self
-                    .links
+                let lk = inner
+                    .m
                     .get_mut(peer)
                     .ok_or_else(|| LinkError::NoPeer(peer.to_string()))?;
-                l.accept_module(module)?;
+                lk.accept_module(module)?;
                 Ok((serde_json::json!("ok"), vec![peer.to_string()]))
             }
             "reject_module" => {
@@ -601,21 +1268,24 @@ impl Links {
                     .get("module")
                     .and_then(Value::as_str)
                     .ok_or(LinkError::BadPayload)?;
-                let l = self
-                    .links
+                let lk = inner
+                    .m
                     .get_mut(peer)
                     .ok_or_else(|| LinkError::NoPeer(peer.to_string()))?;
-                l.reject_module(module)?;
+                lk.reject_module(module)?;
                 Ok((serde_json::json!("ok"), vec![]))
             }
-            "status" => Ok((self.status(), vec![])),
+            "status" => {
+                let status = Self::status_inner(inner);
+                Ok((status, vec![]))
+            }
             _ => Err(LinkError::UnknownMethod(method.to_string())),
         }
     }
 
-    pub fn status(&self) -> Value {
+    fn status_inner(inner: &LinksInner) -> Value {
         let mut links = serde_json::Map::new();
-        for (peer, l) in &self.links {
+        for (peer, l) in &inner.m {
             links.insert(
                 peer.clone(),
                 serde_json::json!({"state": l.state}),
@@ -623,8 +1293,20 @@ impl Links {
         }
         serde_json::json!({
             "links": links,
-            "invite_mode": self.invite_mode,
+            "invite_mode": inner.invite_mode,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn split_method(method: &str) -> (&str, &str) {
+    if let Some(i) = method.find('.') {
+        (&method[..i], &method[i + 1..])
+    } else {
+        ("", method)
     }
 }
 
@@ -690,6 +1372,7 @@ mod tests {
         assert!(resp.ok);
         assert_eq!(l.counter, 1);
         assert!(l.pending.is_none());
+        assert_eq!(l.timestamp, 1000);
     }
 
     #[test]
@@ -699,10 +1382,39 @@ mod tests {
         l.pending = Some(QueuedMsg {
             method: "test".into(),
             payload: None,
+            queued_at: 0,
         });
         l.accept_response(2000);
         assert_eq!(l.counter, 2);
         assert!(l.pending.is_none());
+        assert_eq!(l.timestamp, 2000);
+    }
+
+    #[test]
+    fn validate_timestamp_ok() {
+        let mut l = Link::new("alice", "bob");
+        l.timestamp = 100;
+        assert!(l.validate_timestamp(100, 200).is_ok());
+        assert!(l.validate_timestamp(150, 200).is_ok());
+    }
+
+    #[test]
+    fn validate_timestamp_below_floor() {
+        let mut l = Link::new("alice", "bob");
+        l.timestamp = 100;
+        assert!(matches!(
+            l.validate_timestamp(99, 200),
+            Err(LinkError::Timestamp)
+        ));
+    }
+
+    #[test]
+    fn validate_timestamp_too_far_future() {
+        let l = Link::new("alice", "bob");
+        assert!(matches!(
+            l.validate_timestamp(1000, 200),
+            Err(LinkError::Timestamp)
+        ));
     }
 
     #[test]
@@ -733,34 +1445,64 @@ mod tests {
     }
 
     #[test]
-    fn connect_flow() {
-        let supported = HashMap::new();
-        let mut alice = Links::new("alice".into(), HashMap::new(), InviteMode::Invite, supported.clone());
-        let mut bob = Links::new("bob".into(), HashMap::new(), InviteMode::Invite, supported);
+    fn older_queued_msg_basic() {
+        let a = QueuedMsg { method: "a".into(), payload: None, queued_at: 10 };
+        let b = QueuedMsg { method: "b".into(), payload: None, queued_at: 20 };
+        assert!(older_queued_msg(&a, Some(&b)));
+        assert!(!older_queued_msg(&b, Some(&a)));
+    }
 
-        // Alice creates link with intent to connect.
-        let la = alice.create("bob");
-        la.state.connection.intent_connect = true;
+    #[test]
+    fn older_queued_msg_zero() {
+        let a = QueuedMsg { method: "a".into(), payload: None, queued_at: 0 };
+        let b = QueuedMsg { method: "b".into(), payload: None, queued_at: 10 };
+        assert!(!older_queued_msg(&a, Some(&b))); // zero loses
+        assert!(older_queued_msg(&b, Some(&a))); // set wins over zero
+    }
 
-        // Bob creates link with intent to connect.
-        let lb = bob.create("alice");
-        lb.state.connection.intent_connect = true;
+    #[test]
+    fn older_queued_msg_none() {
+        let a = QueuedMsg { method: "a".into(), payload: None, queued_at: 0 };
+        assert!(older_queued_msg(&a, None)); // anything wins over None
+    }
 
-        // Alice sends connect, Bob receives it — mutual intent.
-        let r = bob
-            .handle_request("alice", "connect", &Value::Null)
-            .unwrap();
-        assert!(r.ok);
-        assert_eq!(
-            bob.get("alice").unwrap().state.connection.status,
-            Some(ConnectionStatus::Connected)
+    #[test]
+    fn split_method_basic() {
+        assert_eq!(split_method("link.connect"), ("link", "connect"));
+        assert_eq!(split_method("trustline.payment"), ("trustline", "payment"));
+        assert_eq!(split_method("close"), ("", "close"));
+    }
+
+    #[test]
+    fn handle_sync_connect_flow() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let clock = Arc::new(AtomicI64::new(1000));
+        let alice = Links::new(
+            "alice".into(),
+            HashMap::new(),
+            InviteMode::Invite,
+            EngineConfig {
+                send: Box::new(|_, _| Err("not wired".into())),
+                commit: Box::new(|| {}),
+                now: Box::new(move || clock.load(Ordering::SeqCst)),
+                retry_delay: Duration::from_secs(60),
+            },
         );
 
-        // Bob's response reaches Alice.
-        alice.handle_response("bob", "connect", &Value::Null, true);
-        assert_eq!(
-            alice.get("bob").unwrap().state.connection.status,
-            Some(ConnectionStatus::Connected)
-        );
+        // Bob connects to alice.
+        let env = SyncRequest {
+            from: "bob".into(),
+            to: "alice".into(),
+            counter: 0,
+            method: "link.connect".into(),
+            payload: None,
+            timestamp: 1000,
+            resp: None,
+        };
+        let resp = alice.handle_sync(env).unwrap();
+        // Invite mode — NACK, link is incoming.
+        assert!(!resp.ok);
+        let lk = alice.get_link("bob").unwrap();
+        assert_eq!(lk.state.connection.status, Some(ConnectionStatus::Incoming));
     }
 }
