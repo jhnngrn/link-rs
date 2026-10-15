@@ -129,7 +129,7 @@ Links runs the outgoing sync loop internally:
 
 - **kick(peer)** — triggers a send attempt for a peer (spawns thread)
 - **kick_all()** — kicks all peers, used at boot to resume pending work
-- **schedule(delay, fn)** — runs fn after delay under the Links mutex, kicks any peers fn returns
+- **schedule(delay, fn)** — runs fn after delay under the Links mutex, commits and kicks any peers fn returns. General-purpose deferred operation — not tied to any specific link or module
 - **send_pending(peer)** — acquires the lock, calls next_tx, sends via EngineConfig.send, handles the response, retries on failure
 - **quick_reject(from, method)** — fast pre-auth rejection before expensive signature verification
 - **handle_sync(env)** — incoming sync: validates, dispatches to modules, persists, kicks
