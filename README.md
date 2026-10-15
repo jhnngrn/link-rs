@@ -8,7 +8,6 @@ Port of [github.com/jhnngrn/link](https://github.com/jhnngrn/link) (Go).
 
 - **Link** — bilateral sync state for one connection: counter, turn bit, pending message, cached response, timestamp
 - **Links** — thread-safe collection of links with policy, module dispatch, and the full sync loop (incoming, outgoing, retry, scheduling)
-- **ConnectionState** — reusable state machine: Status + IntentConnect/IntentClose + reference counting
 - **Module** — trait for application modules: handle_request, handle_response, handle_account, next_tx
 - **EngineConfig** — callbacks the sync loop needs: Send, Commit, Now
 - **Wire types** — SyncRequest, SyncResponse envelopes
