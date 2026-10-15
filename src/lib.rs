@@ -153,7 +153,8 @@ pub trait Module: Send + Sync {
         method: &str,
         payload: &Value,
     ) -> Result<(Value, Vec<String>), LinkError>;
-    fn next_tx(&self, peer: &str) -> Option<QueuedMsg>;
+    /// Returns (method, payload, queued_at). None means nothing to send.
+    fn next_tx(&self, peer: &str) -> Option<(String, Value, i64)>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1163,8 +1164,12 @@ impl Links {
             if !lk.module_enabled(name) {
                 continue;
             }
-            if let Some(mut msg) = module.next_tx(peer) {
-                msg.method = format!("{}.{}", name, msg.method);
+            if let Some((method, payload, queued_at)) = module.next_tx(peer) {
+                let msg = QueuedMsg {
+                    method: format!("{}.{}", name, method),
+                    payload: if payload.is_null() { None } else { Some(payload) },
+                    queued_at,
+                };
                 if older_queued_msg(&msg, best.as_ref()) {
                     best = Some(msg);
                 }
