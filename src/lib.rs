@@ -2,6 +2,7 @@
 //! for bilateral links between parties.
 
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
@@ -137,24 +138,24 @@ pub trait Module: Send + Sync {
         &mut self,
         peer: &str,
         method: &str,
-        payload: &Value,
+        payload: &RawValue,
         ts: i64,
     ) -> Result<(bool, Vec<String>), LinkError>;
     fn handle_response(
         &mut self,
         peer: &str,
         method: &str,
-        payload: &Value,
+        payload: &RawValue,
         ok: bool,
         ts: i64,
     ) -> Vec<String>;
     fn handle_account(
         &mut self,
         method: &str,
-        payload: &Value,
-    ) -> Result<(Value, Vec<String>), LinkError>;
+        payload: &RawValue,
+    ) -> Result<(Box<RawValue>, Vec<String>), LinkError>;
     /// Returns (method, payload, queued_at). None means nothing to send.
-    fn next_tx(&self, peer: &str) -> Option<(String, Value, i64)>;
+    fn next_tx(&self, peer: &str) -> Option<(String, Box<RawValue>, i64)>;
 }
 
 // ---------------------------------------------------------------------------
@@ -165,13 +166,21 @@ pub trait Module: Send + Sync {
 pub struct QueuedMsg {
     pub method: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payload: Option<Value>,
+    pub payload: Option<Box<RawValue>>,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub queued_at: i64,
 }
 
 fn is_zero_i64(v: &i64) -> bool {
     *v == 0
+}
+
+fn null_raw() -> Box<RawValue> {
+    RawValue::from_string("null".into()).unwrap()
+}
+
+fn to_raw(val: &impl Serialize) -> Box<RawValue> {
+    serde_json::value::to_raw_value(val).unwrap()
 }
 
 /// Reports whether a should win over b (older queued_at wins).
@@ -226,7 +235,7 @@ pub struct SyncRequest {
     pub counter: u64,
     pub method: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payload: Option<Value>,
+    pub payload: Option<Box<RawValue>>,
     #[serde(default)]
     pub timestamp: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -699,11 +708,13 @@ impl Links {
                 let pending_payload = lk.pending.as_ref().unwrap().payload.clone();
                 let resp_ok = resp.ok;
                 let resp_ts = resp.timestamp;
+                let nr = null_raw();
+                let payload_ref = pending_payload.as_deref().unwrap_or(&nr);
                 pb_kicks = Self::dispatch_response_inner(
                     &mut inner,
                     &env.from,
                     &pending_method,
-                    &pending_payload.unwrap_or(Value::Null),
+                    payload_ref,
                     resp_ok,
                     resp_ts,
                 );
@@ -740,8 +751,10 @@ impl Links {
         lk.validate_timestamp(ts, now)?;
 
         // Dispatch to handler.
+        let nr2 = null_raw();
+        let req_payload = env.payload.as_deref().unwrap_or(&nr2);
         let (ok, kicks) =
-            Self::dispatch_request_inner(&mut inner, &env.from, &env.method, &env.payload.unwrap_or(Value::Null), ts)?;
+            Self::dispatch_request_inner(&mut inner, &env.from, &env.method, req_payload, ts)?;
 
         let lk = inner.m.get_mut(&env.from).unwrap();
         let resp = lk.accept_request(env.counter, ok, ts);
@@ -929,12 +942,13 @@ impl Links {
                     return;
                 }
 
-                let payload = msg.payload.clone().unwrap_or(Value::Null);
+                let nr = null_raw();
+                let payload_ref = msg.payload.as_deref().unwrap_or(&nr);
                 let extra_kicks = Self::dispatch_response_inner(
                     &mut inner,
                     peer,
                     &msg.method,
-                    &payload,
+                    payload_ref,
                     resp.ok,
                     resp.timestamp,
                 );
@@ -1025,7 +1039,7 @@ impl Links {
         inner: &mut LinksInner,
         peer: &str,
         full_method: &str,
-        payload: &Value,
+        payload: &RawValue,
         ts: i64,
     ) -> Result<(bool, Vec<String>), LinkError> {
         let (ns, method) = split_method(full_method);
@@ -1058,9 +1072,11 @@ impl Links {
                     Ok((true, vec![]))
                 }
                 "module" => {
+                    let pv: Value = serde_json::from_str(payload.get())
+                        .map_err(|_| LinkError::BadPayload)?;
                     let invite_mode = inner.invite_mode;
                     let lk = inner.m.get_mut(peer).unwrap();
-                    let ok = lk.req_module(payload, &inner.modules, invite_mode)?;
+                    let ok = lk.req_module(&pv, &inner.modules, invite_mode)?;
                     Ok((ok, vec![]))
                 }
                 _ => Err(LinkError::UnknownMethod(method.to_string())),
@@ -1085,7 +1101,7 @@ impl Links {
         inner: &mut LinksInner,
         peer: &str,
         full_method: &str,
-        payload: &Value,
+        payload: &RawValue,
         ok: bool,
         ts: i64,
     ) -> Vec<String> {
@@ -1112,7 +1128,9 @@ impl Links {
                     }
                 }
                 "module" => {
-                    lk.resp_module(payload, ok);
+                    if let Ok(pv) = serde_json::from_str::<Value>(payload.get()) {
+                        lk.resp_module(&pv, ok);
+                    }
                 }
                 _ => {}
             }
@@ -1148,7 +1166,7 @@ impl Links {
                 if m.intent_connect {
                     return Some(QueuedMsg {
                         method: "link.module".into(),
-                        payload: Some(serde_json::json!({"name": name})),
+                        payload: Some(to_raw(&serde_json::json!({"name": name}))),
                         queued_at: 0,
                     });
                 }
@@ -1167,7 +1185,7 @@ impl Links {
             if let Some((method, payload, queued_at)) = module.next_tx(peer) {
                 let msg = QueuedMsg {
                     method: format!("{}.{}", name, method),
-                    payload: if payload.is_null() { None } else { Some(payload) },
+                    payload: if payload.get() == "null" { None } else { Some(payload) },
                     queued_at,
                 };
                 if older_queued_msg(&msg, best.as_ref()) {
@@ -1185,8 +1203,8 @@ impl Links {
     pub fn handle_account(
         &self,
         full_method: &str,
-        payload: &Value,
-    ) -> Result<Value, LinkError> {
+        payload: &RawValue,
+    ) -> Result<Box<RawValue>, LinkError> {
         let mut inner = self.inner.lock().unwrap();
         let (ns, method) = split_method(full_method);
 
@@ -1211,11 +1229,13 @@ impl Links {
     fn handle_link_account_inner(
         inner: &mut LinksInner,
         method: &str,
-        payload: &Value,
-    ) -> Result<(Value, Vec<String>), LinkError> {
+        payload: &RawValue,
+    ) -> Result<(Box<RawValue>, Vec<String>), LinkError> {
+        let pv: Value =
+            serde_json::from_str(payload.get()).map_err(|_| LinkError::BadPayload)?;
         match method {
             "set_invite_mode" => {
-                let mode_str = payload
+                let mode_str = pv
                     .get("mode")
                     .and_then(Value::as_str)
                     .ok_or(LinkError::BadPayload)?;
@@ -1226,14 +1246,14 @@ impl Links {
                     _ => return Err(LinkError::InvalidMode(mode_str.to_string())),
                 };
                 inner.invite_mode = mode;
-                Ok((serde_json::json!("ok"), vec![]))
+                Ok((to_raw(&"ok"), vec![]))
             }
             "set_modules" => {
-                let peer = payload
+                let peer = pv
                     .get("peer")
                     .and_then(Value::as_str)
                     .ok_or(LinkError::BadPayload)?;
-                let modules: Vec<String> = payload
+                let modules: Vec<String> = pv
                     .get("modules")
                     .and_then(Value::as_array)
                     .ok_or(LinkError::BadPayload)?
@@ -1246,14 +1266,14 @@ impl Links {
                     .get_mut(peer)
                     .ok_or_else(|| LinkError::NoPeer(peer.to_string()))?;
                 lk.set_modules(&modules, &inner.modules, &inner.protected);
-                Ok((serde_json::json!("ok"), vec![peer.to_string()]))
+                Ok((to_raw(&"ok"), vec![peer.to_string()]))
             }
             "accept_module" => {
-                let peer = payload
+                let peer = pv
                     .get("peer")
                     .and_then(Value::as_str)
                     .ok_or(LinkError::BadPayload)?;
-                let module = payload
+                let module = pv
                     .get("module")
                     .and_then(Value::as_str)
                     .ok_or(LinkError::BadPayload)?;
@@ -1262,14 +1282,14 @@ impl Links {
                     .get_mut(peer)
                     .ok_or_else(|| LinkError::NoPeer(peer.to_string()))?;
                 lk.accept_module(module)?;
-                Ok((serde_json::json!("ok"), vec![peer.to_string()]))
+                Ok((to_raw(&"ok"), vec![peer.to_string()]))
             }
             "reject_module" => {
-                let peer = payload
+                let peer = pv
                     .get("peer")
                     .and_then(Value::as_str)
                     .ok_or(LinkError::BadPayload)?;
-                let module = payload
+                let module = pv
                     .get("module")
                     .and_then(Value::as_str)
                     .ok_or(LinkError::BadPayload)?;
@@ -1278,7 +1298,7 @@ impl Links {
                     .get_mut(peer)
                     .ok_or_else(|| LinkError::NoPeer(peer.to_string()))?;
                 lk.reject_module(module)?;
-                Ok((serde_json::json!("ok"), vec![]))
+                Ok((to_raw(&"ok"), vec![]))
             }
             "status" => {
                 let status = Self::status_inner(inner);
@@ -1288,7 +1308,7 @@ impl Links {
         }
     }
 
-    fn status_inner(inner: &LinksInner) -> Value {
+    fn status_inner(inner: &LinksInner) -> Box<RawValue> {
         let mut links = serde_json::Map::new();
         for (peer, l) in &inner.m {
             links.insert(
@@ -1296,10 +1316,10 @@ impl Links {
                 serde_json::json!({"state": l.state}),
             );
         }
-        serde_json::json!({
+        to_raw(&serde_json::json!({
             "links": links,
             "invite_mode": inner.invite_mode,
-        })
+        }))
     }
 }
 
