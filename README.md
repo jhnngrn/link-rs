@@ -65,9 +65,34 @@ The sync protocol guarantees:
 
 ### Modules
 
-A module is anything that implements the `Module` trait. Links calls `next_tx(peer)` to pull the next outgoing message — it returns `Some((method, payload, ttl))` or `None`. The module decides internally what to send next: a queue, a state machine, a database query, whatever fits. Links doesn't care. It just calls `next_tx`, sends what it gets, and delivers the response back via `handle_response`. Incoming requests arrive through `handle_request`.
+A module is anything that implements the `Module` trait:
 
-Payloads are `Box<RawValue>` — validated but unparsed JSON. The link layer never inspects them; modules parse what they need on their end.
+```rust
+pub trait Module: Send + Sync {
+    fn name(&self) -> &str;
+
+    // Incoming request from peer. Return (ok, kicks).
+    // ok=true accepts, ok=false NACKs. kicks lists peers to send to next.
+    fn handle_request(&mut self, peer: &str, method: &str,
+        payload: &RawValue, ts: i64) -> Result<(bool, Vec<String>), LinkError>;
+
+    // Response to our outgoing request. ok reflects the peer's accept/reject.
+    // Return kicks.
+    fn handle_response(&mut self, peer: &str, method: &str,
+        payload: &RawValue, ok: bool, ts: i64) -> Vec<String>;
+
+    // Admin/account operation (not sync). Return (response, kicks).
+    fn handle_account(&mut self, method: &str,
+        payload: &RawValue) -> Result<(Box<RawValue>, Vec<String>), LinkError>;
+
+    // Pull next outgoing message for peer: (method, payload, ttl).
+    // None means nothing to send. Links polls this — the module decides
+    // internally what's next: a queue, a state machine, whatever fits.
+    fn next_tx(&self, peer: &str) -> Option<(String, Box<RawValue>, i64)>;
+}
+```
+
+Payloads are `Box<RawValue>` — validated but unparsed JSON. The link layer never inspects them; modules parse what they need on their end. Modules don't persist — Links calls `Commit` after every state change.
 
 ### Connection lifecycle
 
