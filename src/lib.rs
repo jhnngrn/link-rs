@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -525,20 +525,14 @@ impl Default for InviteMode {
     }
 }
 
-// ---------------------------------------------------------------------------
-// EngineConfig — callbacks the sync loop needs
-// ---------------------------------------------------------------------------
+const RETRY_DELAY: Duration = Duration::from_secs(60);
 
-/// EngineConfig provides the callbacks Links needs to run the sync loop.
-pub struct EngineConfig {
-    /// Send delivers a sync message to a peer and returns the response body.
-    pub send: Box<dyn Fn(&str, &SyncRequest) -> Result<Vec<u8>, String> + Send + Sync>,
-    /// Commit persists the current state. Called under the mutex.
-    pub commit: Box<dyn Fn() + Send + Sync>,
-    /// Now returns the current time as unix seconds.
-    pub now: Box<dyn Fn() -> i64 + Send + Sync>,
-    /// Retry delay between retry attempts.
-    pub retry_delay: Duration,
+/// Returns the current time as unix seconds.
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 // ---------------------------------------------------------------------------
@@ -559,7 +553,10 @@ struct LinksInner {
 /// Thread-safe — all methods acquire the internal mutex.
 pub struct Links {
     inner: Arc<Mutex<LinksInner>>,
-    engine: Arc<EngineConfig>,
+    /// Send delivers a sync message to a peer and returns the response body.
+    pub send: Arc<dyn Fn(&str, &SyncRequest) -> Result<Vec<u8>, String> + Send + Sync>,
+    /// Commit persists the current state. Called under the mutex.
+    pub commit: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl Links {
@@ -567,19 +564,9 @@ impl Links {
         self_id: String,
         m: HashMap<String, Link>,
         mode: InviteMode,
-        engine: EngineConfig,
+        send: impl Fn(&str, &SyncRequest) -> Result<Vec<u8>, String> + Send + Sync + 'static,
+        commit: impl Fn() + Send + Sync + 'static,
     ) -> Self {
-        let retry_delay = if engine.retry_delay == Duration::ZERO {
-            Duration::from_secs(60)
-        } else {
-            engine.retry_delay
-        };
-        let engine = Arc::new(EngineConfig {
-            send: engine.send,
-            commit: engine.commit,
-            now: engine.now,
-            retry_delay,
-        });
         Self {
             inner: Arc::new(Mutex::new(LinksInner {
                 m,
@@ -589,7 +576,8 @@ impl Links {
                 modules: HashMap::new(),
                 stopped: false,
             })),
-            engine,
+            send: Arc::new(send),
+            commit: Arc::new(commit),
         }
     }
 
@@ -674,7 +662,7 @@ impl Links {
 
         if inner.m.get(&env.from).is_none() {
             if env.method == "link.close" {
-                let now = (self.engine.now)();
+                let now = now_secs();
                 return Ok(SyncResponse {
                     counter: env.counter,
                     ok: true,
@@ -696,7 +684,7 @@ impl Links {
                 Some(ConnectionStatus::Incoming);
         }
 
-        let now = (self.engine.now)();
+        let now = now_secs();
 
         // Piggybacked response.
         let mut pb_kicks = Vec::new();
@@ -720,7 +708,7 @@ impl Links {
                 );
                 let lk = inner.m.get_mut(&env.from).unwrap();
                 lk.accept_response(resp_ts);
-                (self.engine.commit)();
+                (self.commit)();
             }
         }
 
@@ -758,7 +746,7 @@ impl Links {
 
         let lk = inner.m.get_mut(&env.from).unwrap();
         let resp = lk.accept_request(env.counter, ok, ts);
-        (self.engine.commit)();
+        (self.commit)();
 
         let from = env.from.clone();
         drop(inner);
@@ -781,7 +769,8 @@ impl Links {
         let peer = peer.to_string();
         let links = Links {
             inner: Arc::clone(&self.inner),
-            engine: Arc::clone(&self.engine),
+            send: Arc::clone(&self.send),
+            commit: Arc::clone(&self.commit),
         };
         thread::spawn(move || {
             links.send_pending(&peer);
@@ -803,10 +792,11 @@ impl Links {
         F: FnOnce(&mut HashMap<String, Link>) -> Vec<String> + Send + 'static,
     {
         let inner = Arc::clone(&self.inner);
-        let engine = Arc::clone(&self.engine);
+        let commit = Arc::clone(&self.commit);
         let links = Links {
             inner: Arc::clone(&self.inner),
-            engine: Arc::clone(&self.engine),
+            send: Arc::clone(&self.send),
+            commit: Arc::clone(&self.commit),
         };
         thread::spawn(move || {
             thread::sleep(delay);
@@ -815,7 +805,7 @@ impl Links {
                 return;
             }
             let kicks = f(&mut guard.m);
-            (engine.commit)();
+            (commit)();
             drop(guard);
             for k in kicks {
                 links.kick(&k);
@@ -886,18 +876,18 @@ impl Links {
             resp: resp_piggyback,
         };
         if is_dominant {
-            env.timestamp = (self.engine.now)();
+            env.timestamp = now_secs();
             if env.timestamp < floor {
                 env.timestamp = floor;
             }
         }
         if promoted {
-            (self.engine.commit)();
+            (self.commit)();
         }
         let self_id = inner.self_id.clone();
         drop(inner);
 
-        let result = (self.engine.send)(peer, &env);
+        let result = (self.send)(peer, &env);
 
         let mut inner = self.inner.lock().unwrap();
         let peer_s = peer.to_string();
@@ -932,7 +922,7 @@ impl Links {
                     return;
                 }
 
-                let now = (self.engine.now)();
+                let now = now_secs();
                 if lk.validate_timestamp(resp.timestamp, now).is_err() {
                     log::warn!(
                         "[link] {}->{}: bad response timestamp",
@@ -968,7 +958,7 @@ impl Links {
                     false
                 };
 
-                (self.engine.commit)();
+                (self.commit)();
                 if let Some(lk) = inner.m.get_mut(peer) {
                     lk.send = None;
                 }
@@ -1009,9 +999,10 @@ impl Links {
         let peer_s = peer.to_string();
         let links = Links {
             inner: Arc::clone(&self.inner),
-            engine: Arc::clone(&self.engine),
+            send: Arc::clone(&self.send),
+            commit: Arc::clone(&self.commit),
         };
-        let delay = self.engine.retry_delay;
+        let delay = RETRY_DELAY;
         thread::spawn(move || {
             thread::sleep(delay);
             // Check if this timer is still the active one.
@@ -1218,7 +1209,7 @@ impl Links {
             module.handle_account(method, payload)?
         };
 
-        (self.engine.commit)();
+        (self.commit)();
         drop(inner);
         for k in kicks {
             self.kick(&k);

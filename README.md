@@ -9,33 +9,27 @@ Port of [github.com/jhnngrn/link](https://github.com/jhnngrn/link) (Go).
 - **Link** — bilateral sync state for one connection: counter, turn bit, pending message, cached response, timestamp
 - **Links** — thread-safe collection of links with policy, module dispatch, and the full sync loop (incoming, outgoing, retry, scheduling)
 - **Module** — trait for application modules: handle_request, handle_response, handle_account, next_tx
-- **EngineConfig** — callbacks the sync loop needs: Send, Commit, Now
 - **Wire types** — SyncRequest, SyncResponse envelopes
 - **PeerSend** — runtime send lifecycle tracking (in-flight, refractory, retry with cancel tokens)
 
 ## Usage
 
 ```rust
-use link::{Links, EngineConfig, InviteMode, SyncRequest};
+use link::{Links, InviteMode, SyncRequest};
 use serde_json::value::RawValue;
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
-
-// Engine callbacks — the app provides transport and persistence.
-let engine = EngineConfig {
-    send: Box::new(|peer, msg| {
-        // POST msg to peer, return response body
-        todo!()
-    }),
-    commit: Box::new(|| { /* serialize and persist */ }),
-    now: Box::new(|| std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64),
-    retry_delay: Duration::from_secs(60),
-};
 
 // Create a collection for node "alice"
-let ls = Links::new("alice".into(), HashMap::new(), InviteMode::Invite, engine);
+let ls = Links::new(
+    "alice".into(),
+    HashMap::new(),
+    InviteMode::Invite,
+    |peer, msg| {
+        // POST msg to peer, return response body
+        todo!()
+    },
+    || { /* serialize and persist */ },
+);
 
 // Register application modules
 ls.register_module(my_module);
@@ -129,7 +123,7 @@ Links runs the outgoing sync loop internally:
 - **kick(peer)** — triggers a send attempt for a peer (spawns thread)
 - **kick_all()** — kicks all peers, used at boot to resume pending work
 - **schedule(delay, fn)** — runs fn after delay under the Links mutex, commits and kicks any peers fn returns. General-purpose deferred operation — not tied to any specific link or module
-- **send_pending(peer)** — acquires the lock, calls next_tx, sends via EngineConfig.send, handles the response, retries on failure
+- **send_pending(peer)** — acquires the lock, calls next_tx, sends via Send, handles the response, retries on failure
 - **quick_reject(from, method)** — fast pre-auth rejection before expensive signature verification
 - **handle_sync(env)** — incoming sync: validates, dispatches to modules, persists, kicks
 
