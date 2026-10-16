@@ -10,7 +10,7 @@ Port of [github.com/jhnngrn/link](https://github.com/jhnngrn/link) (Go).
 - **Links** — thread-safe collection of links with policy, module dispatch, and the full sync loop (incoming, outgoing, retry, scheduling)
 - **Module** — trait for application modules: handle_request, handle_response, handle_account, next_tx
 - **Wire types** — SyncRequest, SyncResponse envelopes
-- **PeerSend** — runtime send lifecycle tracking (in-flight, refractory, retry with cancel tokens)
+- **PeerSend** — runtime send lifecycle tracking (in-flight, retry with cancel tokens)
 
 ## Usage
 
@@ -78,9 +78,11 @@ pub trait Module: Send + Sync {
     fn handle_account(&mut self, method: &str,
         payload: &RawValue) -> Result<(Box<RawValue>, Vec<String>), LinkError>;
 
-    // Pull next outgoing message for peer: (method, payload, ttl).
-    // None means nothing to send. Links polls this — the module decides
-    // internally what's next: a queue, a state machine, whatever fits.
+    // Pull next outgoing message for peer: (method, payload, queued_at).
+    // None means nothing to send. queued_at is unix seconds —
+    // when multiple modules have a message for the same peer, oldest wins.
+    // Links polls this — the module decides internally what's next:
+    // a queue, a state machine, whatever fits.
     fn next_tx(&self, peer: &str) -> Option<(String, Box<RawValue>, i64)>;
 }
 ```
