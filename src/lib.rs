@@ -265,7 +265,7 @@ pub struct Link {
     #[serde(default, rename = "ts")]
     pub timestamp: i64,
     #[serde(skip)]
-    pub send: Option<PeerSend>,
+    pub sending: Option<PeerSend>,
 }
 
 impl Clone for Link {
@@ -277,7 +277,7 @@ impl Clone for Link {
             pending: self.pending.clone(),
             cached_response: self.cached_response.clone(),
             timestamp: self.timestamp,
-            send: None, // runtime state, not cloned
+            sending: None, // runtime state, not cloned
         }
     }
 }
@@ -292,7 +292,7 @@ impl Link {
             pending: None,
             cached_response: None,
             timestamp: 0,
-            send: None,
+            sending: None,
         }
     }
 
@@ -820,7 +820,7 @@ impl Links {
         inner.stopped = true;
         // Cancel all pending send timers.
         for (_, lk) in inner.m.iter_mut() {
-            lk.send = None;
+            lk.sending = None;
         }
     }
 
@@ -834,12 +834,12 @@ impl Links {
         };
 
         // Check send lifecycle.
-        if let Some(ref s) = lk.send {
+        if let Some(ref s) = lk.sending {
             if s.counter == lk.counter && (s.in_flight || s.refractory) {
                 return;
             }
         }
-        lk.send = None;
+        lk.sending = None;
 
         // Promote if needed.
         let mut promoted = false;
@@ -859,7 +859,7 @@ impl Links {
         let floor = lk.timestamp;
         let msg = lk.pending.clone().unwrap();
         let resp_piggyback = lk.cached_response.clone();
-        lk.send = Some(PeerSend {
+        lk.sending = Some(PeerSend {
             counter,
             in_flight: true,
             refractory: false,
@@ -917,7 +917,7 @@ impl Links {
                     || resp.counter != counter
                 {
                     if let Some(lk) = inner.m.get_mut(peer) {
-                        lk.send = None;
+                        lk.sending = None;
                     }
                     return;
                 }
@@ -960,7 +960,7 @@ impl Links {
 
                 (self.commit)();
                 if let Some(lk) = inner.m.get_mut(peer) {
-                    lk.send = None;
+                    lk.sending = None;
                 }
                 drop(inner);
 
@@ -989,7 +989,7 @@ impl Links {
         };
         let cancel = Arc::new(());
         let weak = Arc::downgrade(&cancel);
-        lk.send = Some(PeerSend {
+        lk.sending = Some(PeerSend {
             counter,
             in_flight: false,
             refractory,
@@ -1013,9 +1013,9 @@ impl Links {
                 let mut inner = links.inner.lock().unwrap();
                 if let Some(lk) = inner.m.get_mut(&peer_s) {
                     // Clear send only if it's still ours.
-                    if let Some(ref s) = lk.send {
+                    if let Some(ref s) = lk.sending {
                         if s.counter == counter {
-                            lk.send = None;
+                            lk.sending = None;
                         }
                     }
                 }
