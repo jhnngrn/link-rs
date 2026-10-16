@@ -208,16 +208,14 @@ pub fn older_queued_msg(a: &QueuedMsg, b: Option<&QueuedMsg>) -> bool {
 // ---------------------------------------------------------------------------
 
 /// PeerSend tracks the outgoing send lifecycle for a link at a given counter.
-/// InFlight means a thread is blocked on Send.
-/// After the send completes, a retry timer is set: refractory after error
-/// (blocks kicks), non-refractory after success (fallback, kicks bypass).
-/// Both are scoped to counter — if counter advances via HandleSync,
-/// the entry is stale and ignored.
+/// InFlight means a thread is blocked on send. After a failed send,
+/// a retry timer is set that blocks kicks until it fires.
+/// Scoped to counter — if counter advances via HandleSync, the entry
+/// is stale and ignored.
 #[derive(Debug)]
 pub struct PeerSend {
     pub counter: u64,
     pub in_flight: bool,
-    pub refractory: bool,
     // Timer handle — when set, a thread is sleeping and will call sendPending.
     // We track it as an Arc<()> "cancel token": when we replace PeerSend,
     // the old Arc drops and the timer thread detects it via weak ref.
@@ -835,7 +833,7 @@ impl Links {
 
         // Check send lifecycle.
         if let Some(ref s) = lk.sending {
-            if s.counter == lk.counter && (s.in_flight || s.refractory) {
+            if s.counter == lk.counter && (s.in_flight || s.cancel.is_some()) {
                 return;
             }
         }
@@ -862,7 +860,6 @@ impl Links {
         lk.sending = Some(PeerSend {
             counter,
             in_flight: true,
-            refractory: false,
             cancel: None,
         });
 
@@ -895,14 +892,14 @@ impl Links {
         match result {
             Err(e) => {
                 log::warn!("[link] {}->{} {}: {}", self_id, peer, msg.method, e);
-                self.set_retry_inner(&mut inner, &peer_s, counter, true);
+                self.set_retry_inner(&mut inner, &peer_s, counter);
                 return;
             }
             Ok(body) => {
                 let resp: SyncResponse = match serde_json::from_slice(&body) {
                     Ok(r) => r,
                     Err(_) => {
-                        self.set_retry_inner(&mut inner, &peer_s, counter, true);
+                        self.set_retry_inner(&mut inner, &peer_s, counter);
                         return;
                     }
                 };
@@ -928,7 +925,7 @@ impl Links {
                         "[link] {}->{}: bad response timestamp",
                         self_id, peer
                     );
-                    self.set_retry_inner(&mut inner, &peer_s, counter, true);
+                    self.set_retry_inner(&mut inner, &peer_s, counter);
                     return;
                 }
 
@@ -979,7 +976,6 @@ impl Links {
         inner: &mut LinksInner,
         peer: &str,
         counter: u64,
-        refractory: bool,
     ) {
         if inner.stopped {
             return;
@@ -992,7 +988,6 @@ impl Links {
         lk.sending = Some(PeerSend {
             counter,
             in_flight: false,
-            refractory,
             cancel: Some(cancel),
         });
 
